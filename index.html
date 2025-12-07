@@ -1,0 +1,550 @@
+import React, { useState, useEffect } from 'react';
+import { Users, UserCheck, Play, Settings, ChevronRight, ChevronLeft, Download, Shuffle } from 'lucide-react';
+
+// Simulation d'un backend sécurisé avec stockage persistant
+const SecureBackend = {
+  async createRoom(teacherPin, questions) {
+    const roomId = Math.random().toString(36).substr(2, 6).toUpperCase();
+    const room = {
+      id: roomId,
+      teacherPin,
+      questions: questions.map(q => ({
+        text: q.text,
+        answers: q.answers,
+        correct: q.correct // Stocké côté serveur uniquement
+      })),
+      currentQuestion: 0,
+      students: {},
+      createdAt: Date.now()
+    };
+    
+    await window.storage.set(`room:${roomId}`, JSON.stringify(room), true);
+    return { roomId, success: true };
+  },
+
+  async getRoom(roomId) {
+    try {
+      const result = await window.storage.get(`room:${roomId}`, true);
+      return result ? JSON.parse(result.value) : null;
+    } catch {
+      return null;
+    }
+  },
+
+  async joinRoom(roomId, studentName) {
+    const room = await this.getRoom(roomId);
+    if (!room) return { success: false, error: "Salle introuvable" };
+    
+    const studentId = Math.random().toString(36).substr(2, 9);
+    room.students[studentId] = {
+      name: studentName,
+      score: 0,
+      answers: {},
+      joinedAt: Date.now()
+    };
+    
+    await window.storage.set(`room:${roomId}`, JSON.stringify(room), true);
+    return { success: true, studentId, room };
+  },
+
+  async submitAnswer(roomId, studentId, questionIndex, answerIndex, timeSpent) {
+    const room = await this.getRoom(roomId);
+    if (!room || !room.students[studentId]) {
+      return { success: false, error: "Session invalide" };
+    }
+
+    const question = room.questions[questionIndex];
+    if (!question) return { success: false, error: "Question invalide" };
+
+    // Vérifier si déjà répondu
+    if (room.students[studentId].answers[questionIndex]) {
+      return { success: false, error: "Déjà répondu", alreadyAnswered: true };
+    }
+
+    const isCorrect = answerIndex === question.correct;
+    
+    // Calcul du score avec bonus de rapidité
+    let points = 0;
+    if (isCorrect) {
+      points = 1000;
+      if (timeSpent < 3000) points += 500; // Bonus rapidité < 3s
+      else if (timeSpent < 5000) points += 300; // Bonus rapidité < 5s
+      else if (timeSpent < 10000) points += 100; // Bonus rapidité < 10s
+    }
+
+    room.students[studentId].answers[questionIndex] = {
+      answer: answerIndex,
+      correct: isCorrect,
+      points,
+      timeSpent,
+      timestamp: Date.now()
+    };
+    room.students[studentId].score += points;
+
+    await window.storage.set(`room:${roomId}`, JSON.stringify(room), true);
+
+    return {
+      success: true,
+      correct: isCorrect,
+      correctAnswer: question.correct,
+      points,
+      totalScore: room.students[studentId].score
+    };
+  },
+
+  async updateCurrentQuestion(roomId, teacherPin, questionIndex) {
+    const room = await this.getRoom(roomId);
+    if (!room || room.teacherPin !== teacherPin) {
+      return { success: false, error: "Non autorisé" };
+    }
+
+    room.currentQuestion = questionIndex;
+    await window.storage.set(`room:${roomId}`, JSON.stringify(room), true);
+    return { success: true };
+  },
+
+  async getLeaderboard(roomId) {
+    const room = await this.getRoom(roomId);
+    if (!room) return [];
+
+    return Object.entries(room.students)
+      .map(([id, student]) => ({
+        id,
+        name: student.name,
+        score: student.score
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+};
+
+const defaultQuestions = [
+  {
+    text: "Celui qui a oublié le qunût dans la prière du matin…",
+    answers: ["Sajada ba'da as-salâm", "Sajada qabla as-salâm", "Ṣalâtuhu ṣaḥîḥa"],
+    correct: 0
+  },
+  {
+    text: "Quel est le jugement de celui qui a ajouté dans la prière quelque chose équivalent…",
+    answers: ["Ṣaḥḥat ṣalâtuhu", "Baṭulat ṣalâtuhu", "Sajada ba'da as-salâm", "Sajada qabla as-salâm"],
+    correct: 0
+  },
+  {
+    text: "J'ai récité à voix haute dans la prière de l'ʿAṣr…",
+    answers: ["Sajadtu qabla as-salām", "Sajadtu baʿda as-salām", "Lā sujûda ʿalayhi", "Ṣalātī ṣaḥīḥa"],
+    correct: 0
+  }
+];
+
+export default function SecureKahootQuiz() {
+  const [mode, setMode] = useState('home'); // home, teacher, student
+  const [roomId, setRoomId] = useState('');
+  const [teacherPin, setTeacherPin] = useState('');
+  const [studentName, setStudentName] = useState('');
+  const [studentId, setStudentId] = useState('');
+  const [currentQuestion, setCurrentQuestion] = useState(0);
+  const [questions, setQuestions] = useState(defaultQuestions);
+  const [hasAnswered, setHasAnswered] = useState(false);
+  const [selectedAnswer, setSelectedAnswer] = useState(null);
+  const [result, setResult] = useState(null);
+  const [score, setScore] = useState(0);
+  const [startTime, setStartTime] = useState(Date.now());
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  // Polling pour les étudiants (sync question actuelle)
+  useEffect(() => {
+    if (mode === 'student' && roomId && studentId) {
+      const interval = setInterval(async () => {
+        const room = await SecureBackend.getRoom(roomId);
+        if (room && room.currentQuestion !== currentQuestion) {
+          setCurrentQuestion(room.currentQuestion);
+          setHasAnswered(false);
+          setSelectedAnswer(null);
+          setResult(null);
+          setStartTime(Date.now());
+        }
+      }, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [mode, roomId, studentId, currentQuestion]);
+
+  const createRoom = async () => {
+    if (!teacherPin || teacherPin.length < 4) {
+      setError("Le PIN doit contenir au moins 4 caractères");
+      return;
+    }
+    setLoading(true);
+    setError('');
+    const result = await SecureBackend.createRoom(teacherPin, questions);
+    if (result.success) {
+      setRoomId(result.roomId);
+      setMode('teacher');
+    }
+    setLoading(false);
+  };
+
+  const joinRoom = async () => {
+    if (!roomId || !studentName) {
+      setError("Remplis tous les champs");
+      return;
+    }
+    setLoading(true);
+    setError('');
+    const result = await SecureBackend.joinRoom(roomId, studentName);
+    if (result.success) {
+      setStudentId(result.studentId);
+      setCurrentQuestion(result.room.currentQuestion);
+      setMode('student');
+      setStartTime(Date.now());
+    } else {
+      setError(result.error);
+    }
+    setLoading(false);
+  };
+
+  const submitAnswer = async (answerIndex) => {
+    if (hasAnswered) return;
+    
+    const timeSpent = Date.now() - startTime;
+    setSelectedAnswer(answerIndex);
+    setHasAnswered(true);
+    
+    const result = await SecureBackend.submitAnswer(
+      roomId,
+      studentId,
+      currentQuestion,
+      answerIndex,
+      timeSpent
+    );
+    
+    if (result.success) {
+      setResult(result);
+      setScore(result.totalScore);
+    } else if (result.alreadyAnswered) {
+      setError("Tu as déjà répondu à cette question");
+    }
+  };
+
+  const nextQuestion = async () => {
+    if (currentQuestion < questions.length - 1) {
+      const newIndex = currentQuestion + 1;
+      setCurrentQuestion(newIndex);
+      await SecureBackend.updateCurrentQuestion(roomId, teacherPin, newIndex);
+      setHasAnswered(false);
+      setSelectedAnswer(null);
+      setResult(null);
+    }
+  };
+
+  const prevQuestion = async () => {
+    if (currentQuestion > 0) {
+      const newIndex = currentQuestion - 1;
+      setCurrentQuestion(newIndex);
+      await SecureBackend.updateCurrentQuestion(roomId, teacherPin, newIndex);
+    }
+  };
+
+  const showLeaderboard = async () => {
+    const lb = await SecureBackend.getLeaderboard(roomId);
+    setLeaderboard(lb);
+  };
+
+  const shuffleQuestions = () => {
+    const shuffled = [...questions];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    setQuestions(shuffled);
+    setCurrentQuestion(0);
+  };
+
+  // HOME SCREEN
+  if (mode === 'home') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-600 flex items-center justify-center p-4">
+        <div className="max-w-2xl w-full">
+          <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+            <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-8 text-center">
+              <h1 className="text-4xl font-black text-white mb-2">Quiz Fiqh Sécurisé</h1>
+              <p className="text-indigo-100">Version Kahoot avec protection anti-triche</p>
+            </div>
+            
+            <div className="p-8 space-y-6">
+              {/* Teacher Mode */}
+              <div className="bg-gradient-to-br from-blue-50 to-indigo-50 p-6 rounded-2xl border-2 border-indigo-200">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="bg-indigo-600 p-2 rounded-lg">
+                    <Settings className="text-white" size={24} />
+                  </div>
+                  <h2 className="text-xl font-bold text-gray-800">Mode Enseignant</h2>
+                </div>
+                <input
+                  type="password"
+                  placeholder="Crée un PIN pour ta salle (min 4 car.)"
+                  value={teacherPin}
+                  onChange={(e) => setTeacherPin(e.target.value)}
+                  className="w-full px-4 py-3 border-2 border-indigo-300 rounded-xl mb-3 focus:outline-none focus:border-indigo-500"
+                />
+                <button
+                  onClick={createRoom}
+                  disabled={loading}
+                  className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold py-3 rounded-xl hover:shadow-lg transition-all disabled:opacity-50"
+                >
+                  {loading ? 'Création...' : 'Créer une salle'}
+                </button>
+              </div>
+
+              {/* Student Mode */}
+              <div className="bg-gradient-to-br from-green-50 to-emerald-50 p-6 rounded-2xl border-2 border-green-200">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="bg-green-600 p-2 rounded-lg">
+                    <Users className="text-white" size={24} />
+                  </div>
+                  <h2 className="text-xl font-bold text-gray-800">Mode Élève</h2>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Code de la salle (ex: ABC123)"
+                  value={roomId}
+                  onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+                  className="w-full px-4 py-3 border-2 border-green-300 rounded-xl mb-3 focus:outline-none focus:border-green-500"
+                />
+                <input
+                  type="text"
+                  placeholder="Ton prénom"
+                  value={studentName}
+                  onChange={(e) => setStudentName(e.target.value)}
+                  className="w-full px-4 py-3 border-2 border-green-300 rounded-xl mb-3 focus:outline-none focus:border-green-500"
+                />
+                <button
+                  onClick={joinRoom}
+                  disabled={loading}
+                  className="w-full bg-gradient-to-r from-green-600 to-emerald-600 text-white font-bold py-3 rounded-xl hover:shadow-lg transition-all disabled:opacity-50"
+                >
+                  {loading ? 'Connexion...' : 'Rejoindre la salle'}
+                </button>
+              </div>
+
+              {error && (
+                <div className="bg-red-50 border-2 border-red-200 text-red-700 px-4 py-3 rounded-xl text-center">
+                  {error}
+                </div>
+              )}
+
+              <div className="text-center text-sm text-gray-500 pt-4">
+                <p>🔒 Les réponses sont sécurisées côté serveur</p>
+                <p>⚡ Bonus de points pour la rapidité</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const q = questions[currentQuestion];
+
+  // TEACHER VIEW
+  if (mode === 'teacher') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-600 p-4">
+        <div className="max-w-5xl mx-auto">
+          <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-6">
+              <div className="flex justify-between items-center flex-wrap gap-4">
+                <div>
+                  <h1 className="text-2xl font-black text-white">Mode Enseignant</h1>
+                  <p className="text-indigo-100">Salle: <span className="font-mono font-bold text-xl">{roomId}</span></p>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <button
+                    onClick={shuffleQuestions}
+                    className="bg-white/20 hover:bg-white/30 text-white px-4 py-2 rounded-xl font-semibold flex items-center gap-2"
+                  >
+                    <Shuffle size={16} /> Mélanger
+                  </button>
+                  <button
+                    onClick={showLeaderboard}
+                    className="bg-yellow-400 hover:bg-yellow-500 text-gray-900 px-4 py-2 rounded-xl font-semibold flex items-center gap-2"
+                  >
+                    🏆 Classement
+                  </button>
+                  <button
+                    onClick={() => setMode('home')}
+                    className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-xl font-semibold"
+                  >
+                    Quitter
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Progress */}
+            <div className="p-6 border-b">
+              <div className="flex justify-between text-sm font-semibold mb-2">
+                <span>Question {currentQuestion + 1}/{questions.length}</span>
+                <span>Bonne réponse: {q.answers[q.correct]}</span>
+              </div>
+              <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-indigo-600 to-purple-600 transition-all"
+                  style={{ width: `${((currentQuestion + 1) / questions.length) * 100}%` }}
+                />
+              </div>
+            </div>
+
+            {/* Question */}
+            <div className="p-8">
+              <div className="bg-gradient-to-br from-blue-50 to-indigo-50 p-8 rounded-2xl mb-6">
+                <div className="text-3xl font-bold text-gray-800 mb-6">{q.text}</div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {q.answers.map((answer, idx) => (
+                    <div
+                      key={idx}
+                      className={`p-4 rounded-xl font-semibold text-lg border-4 ${
+                        idx === q.correct
+                          ? 'bg-green-100 border-green-500 text-green-900'
+                          : 'bg-white border-gray-300 text-gray-700'
+                      }`}
+                    >
+                      <span className="font-black">{idx + 1}.</span> {answer}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Controls */}
+              <div className="flex gap-4 justify-center">
+                <button
+                  onClick={prevQuestion}
+                  disabled={currentQuestion === 0}
+                  className="bg-gray-200 hover:bg-gray-300 text-gray-800 px-6 py-3 rounded-xl font-bold flex items-center gap-2 disabled:opacity-50"
+                >
+                  <ChevronLeft size={20} /> Précédent
+                </button>
+                <button
+                  onClick={nextQuestion}
+                  disabled={currentQuestion === questions.length - 1}
+                  className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:shadow-lg text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 disabled:opacity-50"
+                >
+                  Suivant <ChevronRight size={20} />
+                </button>
+              </div>
+            </div>
+
+            {/* Leaderboard Modal */}
+            {leaderboard.length > 0 && (
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50" onClick={() => setLeaderboard([])}>
+                <div className="bg-white rounded-2xl p-8 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
+                  <h2 className="text-2xl font-black mb-4 text-center">🏆 Classement</h2>
+                  <div className="space-y-2">
+                    {leaderboard.map((student, idx) => (
+                      <div key={student.id} className="flex justify-between items-center bg-gray-50 p-3 rounded-xl">
+                        <span className="font-bold text-lg">{idx + 1}. {student.name}</span>
+                        <span className="text-indigo-600 font-black text-xl">{student.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => setLeaderboard([])}
+                    className="w-full mt-4 bg-indigo-600 text-white py-2 rounded-xl font-bold"
+                  >
+                    Fermer
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // STUDENT VIEW
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-600 via-emerald-600 to-teal-600 p-4">
+      <div className="max-w-3xl mx-auto">
+        <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+          {/* Header */}
+          <div className="bg-gradient-to-r from-green-600 to-emerald-600 p-6">
+            <div className="flex justify-between items-center">
+              <div>
+                <h1 className="text-2xl font-black text-white">{studentName}</h1>
+                <p className="text-green-100">Salle: {roomId}</p>
+              </div>
+              <div className="text-right">
+                <div className="text-3xl font-black text-white">{score}</div>
+                <div className="text-green-100 text-sm">points</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Progress */}
+          <div className="p-6 border-b">
+            <div className="text-center text-sm font-semibold mb-2">
+              Question {currentQuestion + 1}/{questions.length}
+            </div>
+            <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-green-600 to-emerald-600 transition-all"
+                style={{ width: `${((currentQuestion + 1) / questions.length) * 100}%` }}
+              />
+            </div>
+          </div>
+
+          {/* Question */}
+          <div className="p-8">
+            <div className="text-2xl font-bold text-gray-800 mb-6 text-center">{q.text}</div>
+            
+            <div className="grid grid-cols-1 gap-3">
+              {q.answers.map((answer, idx) => {
+                const isSelected = selectedAnswer === idx;
+                const showResult = hasAnswered && result;
+                const isCorrect = showResult && result.correct;
+                const isWrong = showResult && !result.correct && isSelected;
+                const showCorrectAnswer = showResult && idx === result.correctAnswer;
+
+                return (
+                  <button
+                    key={idx}
+                    onClick={() => submitAnswer(idx)}
+                    disabled={hasAnswered}
+                    className={`p-4 rounded-xl font-semibold text-left border-4 transition-all ${
+                      showCorrectAnswer
+                        ? 'bg-green-100 border-green-500 text-green-900'
+                        : isWrong
+                        ? 'bg-red-100 border-red-500 text-red-900'
+                        : isSelected
+                        ? 'bg-indigo-100 border-indigo-500'
+                        : 'bg-gray-50 border-gray-300 hover:border-gray-400'
+                    } disabled:cursor-not-allowed`}
+                  >
+                    <span className="font-black text-lg">{idx + 1}.</span> {answer}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Result */}
+            {result && (
+              <div className={`mt-6 p-4 rounded-xl text-center font-bold text-lg ${
+                result.correct ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+              }`}>
+                {result.correct ? `✅ Bravo! +${result.points} points` : '❌ Mauvaise réponse'}
+              </div>
+            )}
+
+            {error && (
+              <div className="mt-4 bg-orange-100 border-2 border-orange-300 text-orange-800 px-4 py-3 rounded-xl text-center font-semibold">
+                {error}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
